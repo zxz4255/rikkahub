@@ -1,41 +1,104 @@
-name: Build
+name: Daily Build
 
 on:
-  push:
-    branches: [ master, main ]
-  pull_request:
+  # 每天 UTC 09:00、18:00 触发（北京时间 17:00、次日 02:00）
+  schedule:
+    - cron: '0 9,18 * * *'
+  # 也支持手动触发
   workflow_dispatch:
 
 jobs:
-  build:
+  # 检查过去 24 小时内是否有新提交，没有则跳过构建，避免重复打包
+  check:
     runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Check for recent commits
+        id: check
+        run: |
+          # 手动触发时无条件构建
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 定时触发：仅当过去 24 小时内有新提交才构建
+          if [ -n "$(git log --since='24 hours ago' --oneline)" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "过去 24 小时无新提交，跳过构建"
+          fi
 
-      - name: Set up JDK 17
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 发布 Release 需要写权限
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 17
+          distribution: 'temurin'
+          java-version: '17'
 
-      # 官方 Gradle Action：自动缓存 \~/.gradle/caches、wrapper、配置缓存等
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web-ui/pnpm-lock.yaml
+
+      - name: Install web-ui dependencies
+        working-directory: web-ui
+        run: pnpm install --frozen-lockfile
+
+      # 官方 Gradle Action：自动缓存 caches / wrapper / 配置缓存
+      # 第二次及以后构建会明显更快
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: false
-          # 可选：只在默认分支写缓存，PR 只读
-          # cache-read-only: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
 
-      - name: Make gradlew executable
-        run: chmod +x gradlew
+      - name: Prepare build files
+        run: |
+          if [ -n "${{ secrets.KEY_BASE64 }}" ]; then
+            echo "${{ secrets.KEY_BASE64 }}" | base64 -d > app/app.key
+          fi
+          if [ -n "${{ secrets.SIGNING_CONFIG }}" ]; then
+            echo "${{ secrets.SIGNING_CONFIG }}" > local.properties
+          fi
+          if [ -n "${{ secrets.GOOGLE_SERVICES_JSON }}" ]; then
+            echo '${{ secrets.GOOGLE_SERVICES_JSON }}' > app/google-services.json
+          fi
 
-      - name: Build release APK
-        run: ./gradlew assembleRelease -x :web:buildWebUi
+      - name: Gradle Build
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --build-cache
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Publish nightly prerelease
+        uses: softprops/action-gh-release@v2
+        if: success()
         with:
-          name: release-apk
-          path: app/build/outputs/apk/**/*.apk
-          if-no-files-found: warn
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          body: |
+            自动每日构建（commit `${{ github.sha }}`）
+
+            > ⚠️ 开发版本，可能不稳定，仅供测试。
+          files: app/build/outputs/apk/release/*.apk
