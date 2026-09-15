@@ -70,7 +70,13 @@ android {
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            // 有正式 keystore 就用 release 签名，否则回退到 debug 签名，避免 CI/本地无 keystore 时失败
+            val releaseSigning = signingConfigs.getByName("release")
+            signingConfig = if (releaseSigning.storeFile != null) {
+                releaseSigning
+            } else {
+                signingConfigs.getByName("debug")
+            }
             optimization {
                 enable = true
             }
